@@ -45,15 +45,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def load_auth_credentials(auth_file):
-    """Loads Salesforce credentials from an auth.json file."""
+    """Loads Salesforce credentials and API version from an auth.json file with nested result structure."""
     auth_data = json.load(auth_file)
-    access_token = auth_data.get('access_token') or auth_data.get('accessToken')
-    instance_url = auth_data.get('instance_url') or auth_data.get('instanceUrl')
+    # Access the 'result' object
+    result = auth_data.get('result', {})
+    access_token = result.get('accessToken')
+    instance_url = result.get('instanceUrl')
+    api_version = result.get('apiVersion', '60.0')  # Default to 60.0 if missing
 
     if not access_token or not instance_url:
-        raise ValueError("Missing required credentials in auth.json")
+        raise ValueError("Missing required credentials (accessToken or instanceUrl) in auth.json under 'result'")
 
-    return {'access_token': access_token, 'instance_url': instance_url}
+    return {
+        'access_token': access_token,
+        'instance_url': instance_url,
+        'api_version': api_version
+    }
 
 def determine_record_key(endpoint_path, response_json):
     """Determines the key to use for accessing records based on the endpoint."""
@@ -69,7 +76,6 @@ def fetch_data(method, full_url, headers, instance_url, endpoint_path, all_pages
     response_json = None
 
     if method == "GET":
-        # Handle SOQL query if the endpoint is /query
         if 'query' in endpoint_path.lower() and soql_query:
             params = {'q': soql_query}
         else:
@@ -78,7 +84,6 @@ def fetch_data(method, full_url, headers, instance_url, endpoint_path, all_pages
         while full_url:
             try:
                 response = requests.get(full_url, headers=headers, params=params)
-                #st.write(f"Response Status Code: {response.status_code}")
                 if response.status_code != 200:
                     st.error(f"Failed to fetch data: {response.status_code} {response.text}")
                     st.write("Raw Response:", response.text)
@@ -91,19 +96,18 @@ def fetch_data(method, full_url, headers, instance_url, endpoint_path, all_pages
                     st.write("Raw Response:", response.text)
                     return None, None
 
-                # Handle SOQL query response
                 if 'query' in endpoint_path.lower():
                     all_records.extend(response_json.get('records', []))
                     if all_pages and 'nextRecordsUrl' in response_json:
                         st.write(f"Next Records URL: {response_json['nextRecordsUrl']}")
                         full_url = urljoin(instance_url, response_json['nextRecordsUrl'])
-                        params = None  # nextRecordsUrl includes the query, so no params needed
+                        params = None
                     else:
                         full_url = None
                 else:
                     record_key = determine_record_key(endpoint_path, response_json)
                     all_records.extend(response_json.get(record_key, []))
-                    if all_pages and 'nextPageUrl' in response_json and response_json['nextPageUrl'] != None:
+                    if all_pages and 'nextPageUrl' in response_json and response_json['nextPageUrl'] is not None:
                         st.write(f"Next Page URL: {response_json['nextPageUrl']}")
                         full_url = urljoin(instance_url, response_json['nextPageUrl'])
                     else:
@@ -142,6 +146,171 @@ def fetch_data(method, full_url, headers, instance_url, endpoint_path, all_pages
         st.error(f"Unsupported HTTP method: {method}")
         return None, None
 
+def generate_node_js_code(method, full_url, headers, instance_url, endpoint_path, all_pages=False, payload=None, soql_query=None):
+    """Generates equivalent Node.js code for the API operation with command-line auth.json support and nested result structure."""
+    base_code = """
+const axios = require('axios');
+const fs = require('fs');
+const readline = require('readline');
+
+// Function to load auth credentials
+async function loadAuthCredentials() {
+    let authFilePath = process.argv[2]; // Get path from command-line argument
+    
+    if (!authFilePath) {
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+        
+        authFilePath = await new Promise(resolve => {
+            rl.question('Enter the path to auth.json: ', (answer) => {
+                rl.close();
+                resolve(answer);
+            });
+        });
+    }
+    
+    try {
+        const authData = JSON.parse(fs.readFileSync(authFilePath, 'utf8'));
+        const auth = authData.result; // Access the 'result' object
+        const instanceUrl = auth.instanceUrl;
+        const accessToken = auth.accessToken;
+        
+        if (!accessToken || !instanceUrl) {
+            throw new Error('Missing required credentials (accessToken or instanceUrl) in auth.json under "result"');
+        }
+        
+        return { instanceUrl, accessToken };
+    } catch (error) {
+        console.error('Failed to load auth.json:', error.message);
+        process.exit(1);
+    }
+}
+"""
+    
+    if method == "GET":
+        if 'query' in endpoint_path.lower() and soql_query:
+            escaped_soql_query = soql_query.replace("'", "\\'")
+            node_js_code = f"""{base_code}
+async function fetchData() {{
+    try {{
+        const {{ instanceUrl, accessToken }} = await loadAuthCredentials();
+        const headers = {{
+            'Authorization': `Bearer ${{accessToken}}`,
+            'Content-Type': 'application/json'
+        }};
+        
+        let allRecords = [];
+        let url = '{full_url}?q={escaped_soql_query}';
+        
+        while (url) {{
+            const response = await axios.get(url, {{ headers }});
+            const data = response.data;
+            allRecords = allRecords.concat(data.records || []);
+            url = {(f"'{instance_url}' + data.nextRecordsUrl" if all_pages else "null")};
+        }}
+        console.log(JSON.stringify(allRecords));
+    }} catch (error) {{
+        console.error('Error:', error.response ? error.response.data : error.message);
+    }}
+}}
+
+fetchData();
+"""
+        else:
+            node_js_code = f"""{base_code}
+async function fetchData() {{
+    try {{
+        const {{ instanceUrl, accessToken }} = await loadAuthCredentials();
+        const headers = {{
+            'Authorization': `Bearer ${{accessToken}}`,
+            'Content-Type': 'application/json'
+        }};
+        
+        let allRecords = [];
+        let url = '{full_url}';
+        
+        while (url) {{
+            const response = await axios.get(url, {{ headers }});
+            const data = response.data;
+            const recordKey = Object.keys(data).includes('{endpoint_path.split('/')[-1]}') ? 
+                '{endpoint_path.split('/')[-1]}' : Object.keys(data)[0] || 'records';
+            allRecords = allRecords.concat(data[recordKey] || []);
+            url = {(f"'{instance_url}' + data.nextPageUrl" if all_pages else "null")};
+        }}
+        console.log(JSON.stringify(allRecords));
+    }} catch (error) {{
+        console.error('Error:', error.response ? error.response.data : error.message);
+    }}
+}}
+
+fetchData();
+"""
+    elif method == "POST":
+        node_js_code = f"""{base_code}
+async function createData() {{
+    try {{
+        const {{ instanceUrl, accessToken }} = await loadAuthCredentials();
+        const headers = {{
+            'Authorization': `Bearer ${{accessToken}}`,
+            'Content-Type': 'application/json'
+        }};
+        
+        const payload = {json.dumps(payload)};
+        const response = await axios.post('{full_url}', payload, {{ headers }});
+        console.log('Response:', response.data);
+    }} catch (error) {{
+        console.error('Error:', error.response ? error.response.data : error.message);
+    }}
+}}
+
+createData();
+"""
+    elif method == "PATCH":
+        node_js_code = f"""{base_code}
+async function updateData() {{
+    try {{
+        const {{ instanceUrl, accessToken }} = await loadAuthCredentials();
+        const headers = {{
+            'Authorization': `Bearer ${{accessToken}}`,
+            'Content-Type': 'application/json'
+        }};
+        
+        const payload = {json.dumps(payload)};
+        const response = await axios.patch('{full_url}', payload, {{ headers }});
+        console.log('Response:', response.data || 'Update successful');
+    }} catch (error) {{
+        console.error('Error:', error.response ? error.response.data : error.message);
+    }}
+}}
+
+updateData();
+"""
+    elif method == "DELETE":
+        node_js_code = f"""{base_code}
+async function deleteData() {{
+    try {{
+        const {{ instanceUrl, accessToken }} = await loadAuthCredentials();
+        const headers = {{
+            'Authorization': `Bearer ${{accessToken}}`,
+            'Content-Type': 'application/json'
+        }};
+        
+        const response = await axios.delete('{full_url}', {{ headers }});
+        console.log('Response:', 'Delete successful');
+    }} catch (error) {{
+        console.error('Error:', error.response ? error.response.data : error.message);
+    }}
+}}
+
+deleteData();
+"""
+    else:
+        node_js_code = "// Unsupported HTTP method"
+    
+    return node_js_code
+
 def main():
     st.title("Salesforce RESTY")
 
@@ -160,8 +329,20 @@ def main():
            ```
         2. Export credentials:
            ```bash
-           sf mohanc hello myorg -u username > auth.json
+           sf force org display -u <username> --json > auth.json
            ```
+        **Expected auth.json format:**
+        ```json
+        {
+          "status": 0,
+          "result": {
+            "id": "00DHs000000QASYMA4",
+            "apiVersion": "63.0",
+            "accessToken": "your_access_token",
+            "instanceUrl": "https://yourinstance.salesforce.com"
+          }
+        }
+        ```
         **Examples:**
         - GET: `/services/data/v{version}/sobjects/Account`
         - SOQL Query: `/services/data/v{version}/query`  
@@ -183,9 +364,14 @@ def main():
             instance_url = auth_credentials['instance_url'].strip()
             if not instance_url.startswith(('http://', 'https://')):
                 instance_url = 'https://' + instance_url
+            api_version_default = auth_credentials['api_version']
 
-            # API Version input
-            api_version = st.text_input("API Version", value="60.0", help="Enter the Salesforce API version (e.g., 60.0)")
+            # API Version input with dynamic default from auth.json
+            api_version = st.text_input(
+                "API Version",
+                value=api_version_default,
+                help="Enter the Salesforce API version (e.g., 60.0). Loaded from auth.json if available, defaults to 60.0."
+            )
 
             # Layout with columns
             col1, col2 = st.columns([1, 2])
@@ -268,6 +454,18 @@ def main():
 
                     if not data:
                         st.warning("No data returned.")
+
+                    # Display Node.js equivalent code
+                    st.subheader("Node.js Equivalent Code")
+                    node_js_code = generate_node_js_code(method, full_url, headers, instance_url, endpoint_path, all_pages, payload, soql_query)
+                    st.code(node_js_code, language="javascript")
+                    st.markdown("""
+                    **To run in Node.js:**
+                    1. Install dependencies: `npm install axios`
+                    2. Save the code as `salesforce_rest.js`
+                    3. Run with auth file: `node salesforce_rest.js path/to/auth.json`
+                       - Or run without arg and enter path: `node salesforce_rest.js`
+                    """)
 
                 except Exception as e:
                     st.error(f"An error occurred: {e}")
